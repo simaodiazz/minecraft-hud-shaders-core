@@ -1,96 +1,55 @@
 # Hud Resourcepack
 
-A custom HUD rendering system built on top of Minecraft's vanilla text
-rendering pipeline (`rendertype_text` core shaders). It hijacks the boss bar
-title as a rendering surface: individual glyphs (mapped to Private Use Area
-Unicode codepoints via a resource pack font provider) are detected in the
-vertex shader by their vertex color and repositioned to an arbitrary point on
-screen, instead of being rendered in place as normal text. This makes it
-possible to draw fixed badge/icon elements anywhere on the HUD without
-touching Java-side GUI rendering code at all.
+A custom HUD rendering system built on Minecraft's vanilla text rendering
+pipeline (`rendertype_text` core shaders). It hijacks the boss bar title as a
+rendering surface: a glyph (mapped to a Private Use Area codepoint via a
+resource pack font provider) is detected in the vertex shader by its vertex
+color and repositioned to an arbitrary point on screen, instead of rendering
+in place as normal text.
 
-## How an element is identified
+It's fully **responsive**: position is computed from the real framebuffer
+size (`getScreenSize()`, derived from `ProjMat`) every frame, so it adapts to
+window resizing and any GUI Scale automatically.
 
-Each glyph's vertex color is used as an identifier instead of an actual
-color. The R, G, and B channels are each treated as a base-4 digit
-(0–3), giving up to **64 addressable elements** per shader
-(`HUD_CHANNEL_MAX = 3`, `HUD_CHANNEL_BASE = HUD_CHANNEL_MAX + 1`):
+## What changed from the previous design
+
+- Dropped the fixed `Element[]` array entirely (no more `size`, `margin`,
+  `bar`, or a hardcoded list of elements compiled into the shader).
+- Dropped the R/G/B base-4 index scheme. The vertex color no longer *selects*
+  an element — it *is* the position, decoded live every frame.
+- HUD detection moved to the **Alpha channel** (`HUD_ALPHA_MARKER`) instead
+  of requiring R/G/B to fall in a narrow low range — the old scheme collided
+  with plain black text (`#000000`).
+- Added a fixed vertical baseline correction (`offset.y += screen.y * 0.5`)
+  to cancel the boss bar's default near-the-top anchor, so `location`
+  reflects the *whole* screen instead of being relative to that baseline.
+
+## Color encoding
+
+| Channel | Meaning |
+|---|---|
+| R | X position (raw byte, 0–255) |
+| G | Y position (raw byte, 0–255) |
+| B | unused, free for future use |
+| A | must equal `HUD_ALPHA_MARKER`, or the vertex renders as normal text |
+
+Each raw byte is scaled by `LOCATION_STEP` (currently `2`), giving a logical
+range of `0`–`510` per axis. `LOCATION_CENTER = 256` (raw `128`) is the
+middle of the screen; `0` is the left/top edge, `510` the right/bottom edge.
 
 ```
-hudIndex = R * 16 + G * 4 + B
+location = (R, G) * LOCATION_STEP
 ```
 
-Colors outside the 0–3 range per channel are ignored by the HUD system and
-rendered as normal text/UI, so this never intercepts legitimate text colors.
-
-| Element example | R | G | B | Hex color | hudIndex |
-|---|---|---|---|---|---|
-| badge 0 | 0 | 0 | 0 | `#000000` | 0 |
-| badge 1 | 0 | 0 | 1 | `#000001` | 1 |
-| badge 4 | 0 | 1 | 0 | `#000100` | 4 |
-
-The alpha channel is not part of the identifier; keep it at full opacity
-(255) so the glyph itself renders visibly.
-
-## The `Element` struct
-
-```glsl
-struct Element {
-    vec2 size;      // rendered size of the glyph, in GUI-scaled pixels
-    vec2 location;  // anchor position on screen
-    vec2 margin;    // inward padding from the screen edge, in pixels
-    int bar;        // stacking row, for elements sharing a bossbar slot
-};
-```
-
-All numeric fields are `float`/`vec2` (not integers), on purpose — every
-range below is a **soft convention**, not a hard clamp. Nothing in the shader
-enforces these bounds, so values outside the stated range are valid and are
-useful for fine adjustments (nudging an element a couple of pixels past an
-edge, slightly overshooting 100 to bleed off-screen intentionally, etc).
-
-### `size`
-
-Must match the **actual rendered size** of the glyph as scaled by the font
-provider (`height` value in the resource pack's font JSON, combined with the
-source image's aspect ratio) — **not** the raw pixel dimensions of the
-source PNG file, unless the font JSON's `height` happens to equal the PNG's
-real height (in which case they're the same number). Getting this wrong
-doesn't matter for square glyphs (it just scales uniformly), but it distorts
-positioning as soon as width and height differ.
-
-### `location`
-
-Percentage-based anchor position, conceptually 0–100 per axis, but expressed
-in two different conventions per axis:
-
-- **X**: `0` = left edge, `100` = right edge, straightforward 0–100 range.
-- **Y**: centered convention — `-50` = top edge, `0` = vertical middle,
-  `50` = bottom edge. This got flipped/re-derived a few times during
-  development, so it's intentionally documented distinctly from X.
-
-Since these are floats, values like `-55` or `105` are legal and will place
-the element slightly past the corresponding edge — handy for allowing a
-badge to bleed off-screen or compensate for another element's margin.
-
-### `margin`
-
-Extra padding, in pixels (GUI-scaled), always pushed inward from whichever
-edge the element is anchored to. `vec2(0, 0)` means flush to the computed
-anchor point with no extra offset.
-
-### `bar`
-
-Which stacked boss bar "row" the element lives in, used to avoid overlapping
-elements that share the same screen region. Row height is controlled by
-`BAR_ROW_HEIGHT` in the vertex shader. There is no hardcoded engine limit on
-how many boss bars can stack — test up to however many concurrent elements
-your use case actually needs.
+**Testing caveat:** a plain text component's `"color"` field is RGB-only —
+there's no way to set Alpha through it. Set `HUD_ALPHA_MARKER = 255`
+temporarily to test manually via `/bossbar set ... color:"#RRGGBB"`; this
+matches *any* opaque text, so it must be reverted to a value like `254`
+before the plugin drives it for real.
 
 ## Fine-tuning constant
 
-`Y_FINE_TUNE_PIXELS` (in `utils.glsl`) compensates a small residual
-downward offset observed empirically in-game (likely glyph
-baseline/padding, or rounding in `getScreenSize()`'s `ceil()`). It isn't
-derived from the projection math — recalibrate it by eye if the rendering
-pipeline changes.
+`Y_FINE_TUNE_PIXELS` compensates a small residual vertical offset (glyph
+baseline / `ceil()` rounding in `getScreenSize()`). It's recalibrated
+empirically whenever the baseline correction above changes — not derived
+from the projection math.
